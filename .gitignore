@@ -1,0 +1,72 @@
+# Track only the two project trees from this repo root.
+/*
+!/.gitignore
+!/ai-calling/
+!/ai-calling/**
+/freeswitch
+
+# Secrets and local env files.
+**/.env
+**/.env.*
+**/*.pem
+**/*.key
+**/*.crt
+**/*.p12
+**/*.pfx
+**/secrets.json
+**/credentials.json
+
+# Python environments and caches.
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/.venv/
+**/venv/
+**/env/
+**/els/
+**/esp/
+
+# Model artifacts and large local assets.
+**/models/
+**/model/
+**/checkpoints/
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.onnx
+**/*.safetensors
+**/huggingface/
+**/*.faiss
+**/*.index
+**/faiss_index/
+**/faiss_indexes/
+
+# Runtime output and local data.
+**/logs/
+**/*.log
+**/*.wav
+**/*.alaw
+**/*.pcm
+**/*.mp3
+**/*.zip
+
+# Keep brain API clients out of git.
+/ai-calling/brain/app/api_client.py
+/ai-calling/brain/api_client.py
+
+# FreeSWITCH local SIP/account credentials and runtime configs.
+/freeswitch/conf/
+/freeswitch/fscomm/conf/accounts/
+/freeswitch/fscomm/conf/accounts/*.xml
+/freeswitch/**/sofia.conf.xml
+/freeswitch/**/sip_profiles/
+/freeswitch/**/directory/
+/freeswitch/**/gateways/
+/freeswitch/**/vars.xml
+/freeswitch/**/autoload_configs/*sofia*.xml
+/freeswitch/**/autoload_configs/*verto*.xml
+/freeswitch/**/autoload_configs/*event_socket*.xml
+/freeswitch/**/cluecon.tmpl

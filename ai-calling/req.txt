@@ -1,0 +1,36 @@
+# Core
+numpy
+scipy
+pydantic
+requests
+python-dotenv
+
+# GPU Whisper STT
+faster-whisper
+
+# Voice Activity Detection
+silero-vad
+onnxruntime-gpu
+
+# Audio processing
+sounddevice
+soundfile
+pyaudio
+webrtcvad
+
+# TTS
+TTS
+
+# Async networking
+aiohttp
+websockets
+
+# SIP / RTP
+aiortc
+pysip
+
+
+# Utilities
+uvloop
+loguru
+tqdm

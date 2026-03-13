@@ -1,0 +1,13 @@
+crewai
+pydantic
+python-dotenv
+langdetect
+faiss-cpu
+numpy
+transformers
+torch
+litellm
+tiktoken
+aiohttp
+httpx
+asyncio
