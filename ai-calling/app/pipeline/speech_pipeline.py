@@ -1,68 +1,195 @@
+from __future__ import annotations
+
 import asyncio
+import audioop
+import io
+import wave
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
-from app.config.settings import STT_FLUSH_EVERY_N_CHUNKS, STT_FLUSH_INTERVAL_SECONDS, TRANSCRIPT_PATH
-from app.sessions.call_session import CallSession
+import httpx
+
+from app.config.settings import (
+    AI_BRAIN_VOICE_URL,
+    AI_BRAIN_RESPONSE_PATH,
+    FRAME_DURATION_MS,
+    MAX_SPEECH_LENGTH_MS,
+    MIN_SPEECH_LENGTH_MS,
+    PCM_CHANNELS,
+    PCM_SAMPLE_RATE,
+    PCM_SAMPLE_WIDTH_BYTES,
+    SILENCE_STOP_FRAMES,
+    SILENCE_TIMEOUT_MS,
+    SPEECH_STOP_RMS_THRESHOLD,
+    SPEECH_START_RMS_THRESHOLD,
+    STT_WORKERS,
+)
 from app.utils.logger import get_logger
-from app.workers.stt_pool import transcribe
-from app.workers.tts_pool import synthesize
 
 logger = get_logger(__name__)
 
 
-class SpeechPipeline:
-    def __init__(self, session: CallSession) -> None:
-        self.session = session
+@dataclass(slots=True)
+class SegmentationResult:
+    segment_completed: bool = False
+    segment_audio: bytes = b""
+    speech_started: bool = False
+    speech_stopped: bool = False
+    rms: int = 0
 
-    async def process_audio_chunk(self, audio_chunk: bytes) -> Optional[bytes]:
-        self.session.add_speech_chunk(audio_chunk)
 
-        should_flush = (
-            self.session.speech_chunk_counter % STT_FLUSH_EVERY_N_CHUNKS == 0
-            or self.session.seconds_since_last_flush() >= STT_FLUSH_INTERVAL_SECONDS
-        )
-        if not should_flush:
-            return None
+class SpeechSegmenter:
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self._state = "silence"
+        self._speech_ms = 0
+        self._silence_frames = 0
 
-        return await self._flush_buffer("Dispatching buffered audio to STT")
+    def reset(self) -> None:
+        self._buffer.clear()
+        self._state = "silence"
+        self._speech_ms = 0
+        self._silence_frames = 0
 
-    async def flush_on_speech_stop(self) -> Optional[bytes]:
-        return await self._flush_buffer("Speech stop detected, flushing buffered audio to STT")
+    def process_frame(self, frame: bytes) -> SegmentationResult:
+        rms = audioop.rms(frame, PCM_SAMPLE_WIDTH_BYTES) if frame else 0
+        result = SegmentationResult(rms=rms)
+        is_speech_start = rms > SPEECH_START_RMS_THRESHOLD
+        is_speech_stop = rms < SPEECH_STOP_RMS_THRESHOLD
 
-    async def flush_remaining(self) -> Optional[bytes]:
-        return await self._flush_buffer("Flushing remaining buffered audio to STT")
+        if self._state == "silence":
+            if is_speech_start:
+                self._state = "speech"
+                self._buffer.extend(frame)
+                self._speech_ms = FRAME_DURATION_MS
+                self._silence_frames = 0
+                result.speech_started = True
+                logger.info("Speech start detected")
+            return result
 
-    async def _flush_buffer(self, reason: str) -> Optional[bytes]:
-        buffered_audio = self.session.pop_buffer()
-        if not buffered_audio:
-            return None
+        self._buffer.extend(frame)
+        self._speech_ms += FRAME_DURATION_MS
 
-        logger.info(
-            "%s: speech_chunks=%s bytes=%s",
-            reason,
-            self.session.speech_chunk_counter,
-            len(buffered_audio),
-        )
-        text = await transcribe(buffered_audio)
-        if not text:
-            logger.info("STT returned no text")
-            return None
+        if is_speech_stop:
+            self._silence_frames += 1
+        else:
+            self._silence_frames = 0
 
-        await self._append_transcript(text)
-        logger.info("STT recognized text: %s", text)
+        if (
+            self._silence_frames >= SILENCE_STOP_FRAMES
+            or self._speech_ms >= MAX_SPEECH_LENGTH_MS
+        ):
+            segment_duration_ms = self._speech_ms - (self._silence_frames * FRAME_DURATION_MS)
+            result.speech_stopped = True
+            result.segment_completed = True
+            result.segment_audio = self._finalize_segment(trim_silence_frames=self._silence_frames)
+            if segment_duration_ms < MIN_SPEECH_LENGTH_MS:
+                logger.info("Silence chunk ignored")
+                result.segment_audio = b""
+            else:
+                logger.info("Speech stop detected")
+        return result
 
-        logger.info("Dispatching text to TTS: %s", text)
-        return await synthesize(text)
+    def flush(self) -> bytes:
+        if self._state != "speech":
+            return b""
 
-    async def _append_transcript(self, text: str) -> None:
-        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{timestamp}] {text}\n"
+        segment_duration_ms = self._speech_ms - (self._silence_frames * FRAME_DURATION_MS)
+        segment_audio = self._finalize_segment(trim_silence_frames=self._silence_frames)
+        if segment_duration_ms < MIN_SPEECH_LENGTH_MS:
+            logger.info("Silence chunk ignored")
+            return b""
+        logger.info("Speech stop detected")
+        return segment_audio
 
-        def _write() -> None:
-            TRANSCRIPT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with TRANSCRIPT_PATH.open("a", encoding="utf-8") as f:
-                f.write(line)
+    def _finalize_segment(self, trim_silence_frames: int = 0) -> bytes:
+        trim_bytes = trim_silence_frames * FRAME_DURATION_MS * PCM_SAMPLE_WIDTH_BYTES * PCM_CHANNELS * PCM_SAMPLE_RATE // 1000
+        if trim_bytes > 0:
+            segment_audio = bytes(self._buffer[:-trim_bytes]) if trim_bytes < len(self._buffer) else b""
+        else:
+            segment_audio = bytes(self._buffer)
+        self.reset()
+        return segment_audio
 
-        await asyncio.to_thread(_write)
-        logger.info("Transcript appended to %s", TRANSCRIPT_PATH)
+
+def _pcm_to_wav_bytes(pcm_bytes: bytes) -> bytes:
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav_file:
+        wav_file.setnchannels(PCM_CHANNELS)
+        wav_file.setsampwidth(PCM_SAMPLE_WIDTH_BYTES)
+        wav_file.setframerate(PCM_SAMPLE_RATE)
+        wav_file.writeframes(pcm_bytes)
+    return buffer.getvalue()
+
+
+async def transcribe_audio(audio_bytes: bytes) -> str:
+    if not audio_bytes:
+        return ""
+
+    worker = STT_WORKERS[0]
+    wav_bytes = _pcm_to_wav_bytes(audio_bytes)
+    files = {"audio": ("audio.wav", wav_bytes, "audio/wav")}
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(worker, files=files)
+        response.raise_for_status()
+        data = response.json()
+
+    text = data.get("text") if isinstance(data, dict) else ""
+    transcript = str(text or "").strip()
+    if transcript:
+        logger.info("Speech chunk sent to STT")
+    logger.info("STT transcript: %s", transcript)
+    return transcript
+
+
+async def ask_brain(text: str) -> str:
+    if not text:
+        return ""
+
+    chunks: list[str] = []
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        async with client.stream("POST", AI_BRAIN_VOICE_URL, json={"query": text}) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_text():
+                if chunk:
+                    chunks.append(chunk)
+
+    brain_response = "".join(chunks).strip()
+    logger.info("AI response received: %s", brain_response)
+    return brain_response
+
+
+async def process_speech_segment(audio_bytes: bytes) -> None:
+    try:
+        transcript, response = await process_speech_segment_to_reply(audio_bytes)
+        if not transcript:
+            logger.info("STT returned empty transcript")
+            return
+        print(f"User: {transcript}")
+        print(f"AI: {response}")
+    except Exception:
+        logger.exception("Speech segment processing failed")
+
+
+async def process_speech_segment_to_reply(audio_bytes: bytes) -> tuple[str, str]:
+    transcript = await transcribe_audio(audio_bytes)
+    if not transcript:
+        return "", ""
+
+    response = await ask_brain(transcript)
+    await _append_brain_response(transcript, response)
+    return transcript, response
+
+
+async def _append_brain_response(transcript: str, response: str) -> None:
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{timestamp}] User: {transcript}\n[{timestamp}] AI: {response}\n\n"
+
+    def _write() -> None:
+        AI_BRAIN_RESPONSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with AI_BRAIN_RESPONSE_PATH.open("a", encoding="utf-8") as handle:
+            handle.write(line)
+
+    await asyncio.to_thread(_write)

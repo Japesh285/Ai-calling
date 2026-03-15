@@ -34,3 +34,4 @@ pysip
 uvloop
 loguru
 tqdm
+edge-tts

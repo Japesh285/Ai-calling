@@ -3,3 +3,4 @@ uvicorn
 httpx 
 websockets 
 python-dotenv
+edge-tts

@@ -617,7 +617,7 @@ class SupportCrew:
             max_iter=4,
             max_execution_time=50,
             allow_delegation=False,
-            verbose=True
+            verbose=False
         )
 
     def _create_lang_detection_agent(self):
@@ -633,7 +633,7 @@ class SupportCrew:
             "If the sentence follows English grammar and vocabulary, classify it as English. "
             "Always return just one word from the set: 'Hindi', 'English', or 'Hinglish'."
         ),
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
         
     )
@@ -658,7 +658,7 @@ class SupportCrew:
                 f"If users ask to join as a retailer or are willing to signup, ensure they receive proper guidance."
                 
             ),
-            verbose=True,
+            verbose=False,
             allow_delegation=False,
         )
 
@@ -772,7 +772,7 @@ class SupportCrew:
             agents=[self.language_detector,self.specialist, self.quality],
             tasks=[lang_detection,inquiry_task, quality_assurance_review],
             process=Process.sequential, 
-            verbose=True,
+            verbose=False,
         )
 
  

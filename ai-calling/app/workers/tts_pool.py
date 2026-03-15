@@ -6,14 +6,14 @@ from pathlib import Path
 from typing import Optional
 import wave
 
+import httpx
+
 from app.config.settings import (
     PCM_CHANNELS,
     PCM_SAMPLE_RATE,
     PCM_SAMPLE_WIDTH_BYTES,
     TTS_AUDIO_DUMP_DIR,
-    TTS_COMMAND,
-    TTS_SCRIPT_CWD,
-    TTS_SCRIPT_NAME,
+    TTS_WORKERS,
 )
 from app.utils.logger import get_logger
 
@@ -77,33 +77,14 @@ async def synthesize(text: str) -> Optional[bytes]:
     if not clean_text:
         return None
 
-    script_path = Path(TTS_SCRIPT_CWD) / TTS_SCRIPT_NAME
-    if not script_path.exists():
-        logger.error("TTS script not found at %s", script_path)
-        return None
-
     logger.info("Starting TTS worker for text length=%s", len(clean_text))
-    process = await asyncio.create_subprocess_exec(
-        *TTS_COMMAND,
-        clean_text,
-        cwd=str(TTS_SCRIPT_CWD),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
+    worker = TTS_WORKERS[0]
+    async with httpx.AsyncClient(timeout=180.0) as client:
+        response = await client.post(worker, json={"text": clean_text})
+        response.raise_for_status()
+        raw_audio = response.content
 
-    if process.returncode != 0:
-        logger.error(
-            "TTS process failed with code %s: %s",
-            process.returncode,
-            (stderr or b"").decode(errors="replace").strip(),
-        )
-        return None
-
-    if stderr:
-        logger.info("TTS stderr: %s", stderr.decode(errors="replace").strip())
-
-    normalized_audio = _normalize_tts_audio(stdout or b"")
+    normalized_audio = _normalize_tts_audio(raw_audio)
     if normalized_audio:
         logger.info("TTS produced outbound audio bytes=%s", len(normalized_audio))
         dump_path = await asyncio.to_thread(_dump_tts_audio, normalized_audio)

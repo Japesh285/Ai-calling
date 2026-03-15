@@ -2,34 +2,35 @@ import asyncio
 import base64
 import audioop
 import json
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 import wave
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
-from app.audio.audio_inspector import inspect_packet
-from app.audio.vad import RealtimeSpeechGate
+from app.audio.tts_streamer import (
+    convert_pcm16_bytes_to_pcma,
+    generate_tts,
+    stream_pcma_audio,
+    test_noise,
+)
 from app.config.settings import (
     BASE_DIR,
     FREESWITCH_AUDIO_DUMP_DIR,
     FREESWITCH_RAW_DUMP_DIR,
     PCM_CHANNELS,
+    PCMA_FRAME_BYTES,
     PCM_SAMPLE_RATE,
     PCM_SAMPLE_WIDTH_BYTES,
+    TTS_PLAYBACK_GUARD_MS,
 )
-from app.pipeline.speech_pipeline import SpeechPipeline
+from app.pipeline.speech_pipeline import SpeechSegmenter, process_speech_segment_to_reply
 from app.sessions.call_session import CallSession
 from app.utils.logger import get_logger
 
 router = APIRouter()
 logger = get_logger(__name__)
-
-PCM16_FRAME_BYTES = 320
-DEBUG_DUMP_PACKETS = 10
-INSPECT_VERBOSE_PACKETS = 20
-DEBUG_RAW_DUMP_PATH = BASE_DIR / "logs" / "audio_debug_dump.pcm"
-
 
 def _dump_inbound_audio(audio_bytes: bytes) -> Path | None:
     if not audio_bytes:
@@ -65,18 +66,13 @@ def _dump_raw_audio(audio_bytes: bytes) -> Path | None:
 async def audio_stream(ws: WebSocket) -> None:
     await ws.accept()
     session = CallSession()
-    pipeline = SpeechPipeline(session)
-    speech_gate = RealtimeSpeechGate()
+    segmenter = SpeechSegmenter()
     client = getattr(ws, "client", None)
     client_label = f"{client.host}:{client.port}" if client else "unknown"
-    packet_counter = 0
     pcm_buffer = bytearray()
-
-    logger.info(
-        "Call websocket accepted: client=%s path=%s",
-        client_label,
-        ws.url.path,
-    )
+    segment_tasks: set[asyncio.Task[None]] = set()
+    send_lock = asyncio.Lock()
+    playback_state = {"suppress_until": 0.0}
 
     try:
         while True:
@@ -94,94 +90,53 @@ async def audio_stream(ws: WebSocket) -> None:
             if not audio_chunk:
                 continue
 
-            packet_counter += 1
-            diagnostics = inspect_packet(audio_chunk)
-            if packet_counter <= DEBUG_DUMP_PACKETS:
-                await _append_debug_raw_dump(audio_chunk)
-            if packet_counter <= INSPECT_VERBOSE_PACKETS or packet_counter % 100 == 0:
-                logger.info(
-                    "AUDIO_INSPECT packet_bytes=%s frame_size=%s first_bytes=%s unique_bytes=%s likely=%s pcm16_rms=%s",
-                    diagnostics["packet_bytes"],
-                    PCM16_FRAME_BYTES,
-                    diagnostics["first_bytes"],
-                    diagnostics["unique_bytes"],
-                    diagnostics["likely"],
-                    diagnostics["pcm16_rms"],
-                )
-
             pcm_buffer.extend(audio_chunk)
 
-            if packet_counter <= 5 or packet_counter % 100 == 0:
-                logger.warning(
-                    "PCM stream buffer: packet_bytes=%s buffered_bytes=%s complete_frames=%s",
-                    len(audio_chunk),
-                    len(pcm_buffer),
-                    len(pcm_buffer) // PCM16_FRAME_BYTES,
-                )
-
-            audio_out = None
-            while len(pcm_buffer) >= PCM16_FRAME_BYTES:
-                frame = bytes(pcm_buffer[:PCM16_FRAME_BYTES])
-                del pcm_buffer[:PCM16_FRAME_BYTES]
-                pcm16_chunk = frame
+            while len(pcm_buffer) >= 320:
+                frame = bytes(pcm_buffer[:320])
+                del pcm_buffer[:320]
 
                 session.add_raw_chunk(frame)
-                session.add_inbound_chunk(pcm16_chunk)
-                vad_result = speech_gate.process_frame(pcm16_chunk)
+                session.add_inbound_chunk(frame)
 
-                if vad_result.speech_started:
-                    logger.info(
-                        "Speech start: client=%s frame=%s rms=%s",
-                        client_label,
-                        session.frame_counter,
-                        vad_result.rms,
+                if time.monotonic() < playback_state["suppress_until"]:
+                    segmenter.reset()
+                    continue
+
+                segment_result = segmenter.process_frame(frame)
+
+                if segment_result.segment_completed and segment_result.segment_audio:
+                    task = asyncio.create_task(
+                        _process_segment_and_respond(
+                            ws,
+                            segment_result.segment_audio,
+                            send_lock,
+                            client_label,
+                            playback_state,
+                        )
                     )
-
-                if session.frame_counter <= 5 or session.frame_counter % 50 == 0:
-                    logger.info(
-                        "Call audio frame checkpoint: frame=%s raw_bytes=%s pcm_bytes=%s rms=%s speech=%s",
-                        session.frame_counter,
-                        len(frame),
-                        len(pcm16_chunk),
-                        vad_result.rms,
-                        vad_result.is_speech,
-                    )
-
-                if vad_result.speech_chunk:
-                    frame_audio_out = await pipeline.process_audio_chunk(vad_result.speech_chunk)
-                    audio_out = audio_out or frame_audio_out
-
-                if vad_result.speech_stopped:
-                    logger.info(
-                        "Speech stop: client=%s frame=%s buffered_speech_bytes=%s",
-                        client_label,
-                        session.frame_counter,
-                        len(session.stt_buffer),
-                    )
-                    frame_audio_out = await pipeline.flush_on_speech_stop()
-                    audio_out = audio_out or frame_audio_out
-
-                if audio_out:
-                    logger.info("Sending TTS audio back to FreeSWITCH: %s bytes", len(audio_out))
-                    await ws.send_bytes(audio_out)
-                    audio_out = None
+                    segment_tasks.add(task)
+                    task.add_done_callback(segment_tasks.discard)
 
     except WebSocketDisconnect:
-        logger.info("Call websocket disconnected: client=%s path=%s", client_label, ws.url.path)
+        pass
     finally:
-        if pcm_buffer:
-            logger.info(
-                "Discarding trailing partial PCM frame bytes=%s on disconnect",
-                len(pcm_buffer),
+        trailing_segment = segmenter.flush()
+        if trailing_segment:
+            task = asyncio.create_task(
+                _process_segment_and_respond(
+                    ws,
+                    trailing_segment,
+                    send_lock,
+                    client_label,
+                    playback_state,
+                )
             )
+            segment_tasks.add(task)
+            task.add_done_callback(segment_tasks.discard)
 
-        final_audio = await pipeline.flush_remaining()
-        if final_audio:
-            try:
-                logger.info("Sending final TTS audio back to FreeSWITCH: %s bytes", len(final_audio))
-                await ws.send_bytes(final_audio)
-            except Exception:
-                logger.info("Could not send final TTS audio after disconnect")
+        if segment_tasks:
+            await asyncio.gather(*segment_tasks, return_exceptions=True)
 
         raw_audio_path = await _save_raw_audio_dump(session)
         if raw_audio_path:
@@ -204,13 +159,6 @@ async def audio_stream(ws: WebSocket) -> None:
                 len(session.get_raw_audio()),
                 total_rms,
             )
-
-        logger.info(
-            "Call session closed: client=%s total_frames=%s speech_chunks=%s",
-            client_label,
-            session.frame_counter,
-            session.speech_chunk_counter,
-        )
 
 
 def _extract_audio_from_text_frame(text_frame: str) -> bytes | None:
@@ -236,6 +184,47 @@ def _extract_audio_from_text_frame(text_frame: str) -> bytes | None:
     return None
 
 
+async def _process_segment_and_respond(
+    ws: WebSocket,
+    audio_bytes: bytes,
+    send_lock: asyncio.Lock,
+    client_label: str,
+    playback_state: dict[str, float],
+) -> None:
+    try:
+        transcript, response = await process_speech_segment_to_reply(audio_bytes)
+        if not transcript:
+            logger.info("STT returned empty transcript for %s", client_label)
+            return
+
+        print(f"User: {transcript}")
+        print(f"AI: {response}")
+
+        async with send_lock:
+            pcm16_audio = await generate_tts(response)
+            if not pcm16_audio:
+                logger.info("No TTS audio generated for %s", client_label)
+                return
+
+            pcma_audio = await convert_pcm16_bytes_to_pcma(pcm16_audio)
+            if not pcma_audio:
+                logger.info("No PCMA audio generated for %s", client_label)
+                return
+
+            playback_seconds = (len(pcma_audio) / PCMA_FRAME_BYTES) * 0.02
+            playback_state["suppress_until"] = (
+                time.monotonic() + playback_seconds + (TTS_PLAYBACK_GUARD_MS / 1000.0)
+            )
+            await stream_pcma_audio(ws, pcma_audio)
+            logger.info(
+                "Sent TTS audio back to FreeSWITCH client=%s bytes=%s",
+                client_label,
+                len(pcma_audio),
+            )
+    except Exception:
+        logger.exception("Speech segment response failed for %s", client_label)
+
+
 async def _save_inbound_audio_dump(session: CallSession) -> Path | None:
     inbound_audio = session.get_inbound_audio()
     if not inbound_audio:
@@ -252,10 +241,5 @@ async def _save_raw_audio_dump(session: CallSession) -> Path | None:
     return await asyncio.to_thread(_dump_raw_audio, raw_audio)
 
 
-async def _append_debug_raw_dump(packet: bytes) -> None:
-    def _write() -> None:
-        DEBUG_RAW_DUMP_PATH.parent.mkdir(parents=True, exist_ok=True)
-        with DEBUG_RAW_DUMP_PATH.open("ab") as handle:
-            handle.write(packet)
-
-    await asyncio.to_thread(_write)
+async def _send_test_tone(ws: WebSocket) -> None:
+    await test_noise(ws)

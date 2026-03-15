@@ -1,33 +1,31 @@
-import torch
-from fastapi import FastAPI, UploadFile
-from faster_whisper import WhisperModel
-import tempfile
+import io
+import wave
+
+from fastapi import FastAPI, HTTPException, UploadFile
+
+from app.stt.faster_whisper_stt import FasterWhisperSTT
+
 
 app = FastAPI()
-
-print("Loading Whisper model...")
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-compute_type = "float16" if device == "cuda" else "int8"
-
-model = WhisperModel(
-    "medium",
-    device=device,
-    compute_type=compute_type,
-)
-
-print(f"Whisper model loaded on {device} ({compute_type})")
+stt = FasterWhisperSTT()
 
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile):
+    audio_bytes = await audio.read()
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Empty audio upload")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as f:
-        f.write(await audio.read())
-        path = f.name
+    try:
+        with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+            if wav_file.getnchannels() != 1:
+                raise HTTPException(status_code=400, detail="Audio must be mono")
+            if wav_file.getsampwidth() != 2:
+                raise HTTPException(status_code=400, detail="Audio must be 16-bit PCM")
 
-    segments, info = model.transcribe(path)
+            pcm_bytes = wav_file.readframes(wav_file.getnframes())
+    except wave.Error as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid WAV upload: {exc}") from exc
 
-    text = " ".join([seg.text for seg in segments])
-
-    return {"text": text}
+    text = stt.transcribe(pcm_bytes)
+    return {"text": text, "language": stt.last_detected_language}

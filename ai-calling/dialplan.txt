@@ -1,0 +1,16 @@
+<extension name="ai_audio_stream">
+      <condition field="destination_number" expression="^219$">
+
+        <action application="answer"/>
+
+        <!-- force stable codec for STT -->
+        <action application="set" data="absolute_codec_string=PCMA"/>
+
+        <!-- start websocket stream -->
+        <action application="system"
+            data="/usr/local/freeswitch/bin/fs_cli -x &quot;uuid_audio_stream ${uuid} start ws://127.0.0.1:8000/audio-stream mono 8k&quo>
+        <!-- keep call alive -->
+        <action application="sleep" data="300000"/>
+
+      </condition>
+    </extension>
