@@ -2,6 +2,10 @@ import asyncio
 import base64
 import audioop
 import json
+import os
+import subprocess
+import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,8 +16,6 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from app.audio.tts_streamer import (
     convert_pcm16_bytes_to_pcma,
     generate_tts,
-    stream_pcma_audio,
-    test_noise,
 )
 from app.config.settings import (
     BASE_DIR,
@@ -60,11 +62,85 @@ def _dump_raw_audio(audio_bytes: bytes) -> Path | None:
     return output_path
 
 
+def play_to_caller(uuid: str, pcma_audio: bytes) -> None:
+    if not uuid:
+        raise ValueError("Call UUID is required for playback")
+    if not pcma_audio:
+        raise ValueError("PCMA audio is required for playback")
+
+    def delayed_delete(path: str) -> None:
+        time.sleep(5)
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+
+    temp_path: str | None = None
+    try:
+        pcm16_audio = audioop.alaw2lin(pcma_audio, 2)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            temp_path = handle.name
+
+        with wave.open(temp_path, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(8000)
+            wav_file.writeframes(pcm16_audio)
+
+        command = [
+            "/usr/local/freeswitch/bin/fs_cli",
+            "-x",
+            f"uuid_broadcast {uuid} {temp_path} aleg",
+        ]
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        if stdout:
+            logger.info("FreeSWITCH command stdout: %s", stdout)
+        if stderr:
+            logger.info("FreeSWITCH command stderr: %s", stderr)
+
+        if result.returncode == 0:
+            logger.info("Playback succeeded for call_uuid=%s file=%s", uuid, temp_path)
+        else:
+            logger.error(
+                "Playback failed for call_uuid=%s code=%s file=%s",
+                uuid,
+                result.returncode,
+                temp_path,
+            )
+
+        if temp_path:
+            threading.Thread(target=delayed_delete, args=(temp_path,), daemon=True).start()
+    except subprocess.TimeoutExpired:
+        logger.error("Playback command timed out for call_uuid=%s", uuid)
+        if temp_path:
+            threading.Thread(target=delayed_delete, args=(temp_path,), daemon=True).start()
+    except Exception:
+        logger.exception("Playback failed for call_uuid=%s", uuid)
+        if temp_path:
+            threading.Thread(target=delayed_delete, args=(temp_path,), daemon=True).start()
+
+
 @router.websocket("/audio-stream")
 @router.websocket("/audio")
 @router.websocket("/ws/audio")
 async def audio_stream(ws: WebSocket) -> None:
     await ws.accept()
+    call_uuid = ws.query_params.get("uuid")
+    if not call_uuid:
+        logger.error("Missing FreeSWITCH call UUID in websocket query params")
+        await ws.close(code=1008, reason="Missing call UUID")
+        return
+
+    logger.info("Connected FreeSWITCH call UUID: %s", call_uuid)
     session = CallSession()
     segmenter = SpeechSegmenter()
     client = getattr(ws, "client", None)
@@ -108,10 +184,10 @@ async def audio_stream(ws: WebSocket) -> None:
                 if segment_result.segment_completed and segment_result.segment_audio:
                     task = asyncio.create_task(
                         _process_segment_and_respond(
-                            ws,
                             segment_result.segment_audio,
                             send_lock,
                             client_label,
+                            call_uuid,
                             playback_state,
                         )
                     )
@@ -125,10 +201,10 @@ async def audio_stream(ws: WebSocket) -> None:
         if trailing_segment:
             task = asyncio.create_task(
                 _process_segment_and_respond(
-                    ws,
                     trailing_segment,
                     send_lock,
                     client_label,
+                    call_uuid,
                     playback_state,
                 )
             )
@@ -185,10 +261,10 @@ def _extract_audio_from_text_frame(text_frame: str) -> bytes | None:
 
 
 async def _process_segment_and_respond(
-    ws: WebSocket,
     audio_bytes: bytes,
     send_lock: asyncio.Lock,
     client_label: str,
+    call_uuid: str | None,
     playback_state: dict[str, float],
 ) -> None:
     try:
@@ -211,16 +287,16 @@ async def _process_segment_and_respond(
                 logger.info("No PCMA audio generated for %s", client_label)
                 return
 
+            if not call_uuid:
+                logger.error("Cannot play response for %s without call UUID", client_label)
+                return
+
             playback_seconds = (len(pcma_audio) / PCMA_FRAME_BYTES) * 0.02
             playback_state["suppress_until"] = (
                 time.monotonic() + playback_seconds + (TTS_PLAYBACK_GUARD_MS / 1000.0)
             )
-            await stream_pcma_audio(ws, pcma_audio)
-            logger.info(
-                "Sent TTS audio back to FreeSWITCH client=%s bytes=%s",
-                client_label,
-                len(pcma_audio),
-            )
+            await asyncio.to_thread(play_to_caller, call_uuid, pcma_audio)
+            logger.info("Queued TTS playback for client=%s bytes=%s", client_label, len(pcma_audio))
     except Exception:
         logger.exception("Speech segment response failed for %s", client_label)
 
@@ -239,7 +315,3 @@ async def _save_raw_audio_dump(session: CallSession) -> Path | None:
         return None
 
     return await asyncio.to_thread(_dump_raw_audio, raw_audio)
-
-
-async def _send_test_tone(ws: WebSocket) -> None:
-    await test_noise(ws)
