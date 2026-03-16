@@ -1,5 +1,6 @@
 import asyncio
 import io
+import threading
 
 import torch
 from fastapi import FastAPI, HTTPException
@@ -27,6 +28,7 @@ class SynthesizeRequest(BaseModel):
 
 app = FastAPI(title="TTS Worker")
 tts_model = _load_tts()
+tts_model_lock = threading.Lock()
 
 
 @app.get("/")
@@ -35,10 +37,12 @@ async def root() -> dict[str, str]:
 
 
 def _synthesize_wav_bytes(text: str, speaker: str, language: str) -> bytes:
-    wav = tts_model.tts(text=text, speaker=speaker, language=language)
-    buffer = io.BytesIO()
-    tts_model.synthesizer.save_wav(wav=wav, path=buffer)
-    return buffer.getvalue()
+    # XTTS inference is not thread-safe when sharing one in-process model.
+    with tts_model_lock:
+        wav = tts_model.tts(text=text, speaker=speaker, language=language)
+        buffer = io.BytesIO()
+        tts_model.synthesizer.save_wav(wav=wav, path=buffer)
+        return buffer.getvalue()
 
 
 @app.post("/synthesize")

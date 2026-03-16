@@ -18,6 +18,7 @@ from app.config.settings import (
 from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
+_tts_worker_index = 0
 
 
 def _dump_tts_audio(audio_bytes: bytes) -> Optional[Path]:
@@ -73,12 +74,14 @@ def _normalize_tts_audio(audio_bytes: bytes) -> Optional[bytes]:
 
 
 async def synthesize(text: str) -> Optional[bytes]:
+    global _tts_worker_index
     clean_text = (text or "").strip()
     if not clean_text:
         return None
 
     logger.info("Starting TTS worker for text length=%s", len(clean_text))
-    worker = TTS_WORKERS[0]
+    worker = TTS_WORKERS[_tts_worker_index % len(TTS_WORKERS)]
+    _tts_worker_index += 1
     async with httpx.AsyncClient(timeout=180.0) as client:
         response = await client.post(worker, json={"text": clean_text})
         response.raise_for_status()
