@@ -33,13 +33,19 @@ class FasterWhisperSTT:
         audio_16k = librosa.resample(audio_float32, orig_sr=8000, target_sr=16000)
 
         segments, info = self.model.transcribe(
-            audio_16k,
-            beam_size=5,
-            vad_filter=True,
-            condition_on_previous_text=False,
-        )
+        audio_16k,
+        language=None,              # allow auto detection
+        task="transcribe",
+        beam_size=3,
+        condition_on_previous_text=False,
+        vad_filter=False,
+        initial_prompt="The following conversation may contain Hindi and English spoken by an Indian speaker.",
+    )
 
         self.last_detected_language = getattr(info, "language", "") or ""
+        if self.last_detected_language not in {"en", "hi"}:
+            logger.warning("Unexpected language detected: %s → forcing hi", self.last_detected_language)
+            self.last_detected_language = "hi"
         logger.info("Detected language: %s", self.last_detected_language)
 
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())

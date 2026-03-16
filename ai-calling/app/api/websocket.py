@@ -39,7 +39,7 @@ from app.utils.logger import get_logger
 router = APIRouter()
 logger = get_logger(__name__)
 PLAYBACK_LOCK = asyncio.Lock()
-TTS_WORKER_COUNT = max(3, len(TTS_WORKERS))
+TTS_WORKER_COUNT = 1
 
 
 def _dump_inbound_audio(audio_bytes: bytes) -> Path | None:
@@ -260,25 +260,7 @@ async def audio_stream(ws: WebSocket) -> None:
                     )
                     continue
 
-                if segment_result.partial_stt_triggered and segment_result.partial_audio:
-                    state = utterance_states.setdefault(
-                        segment_result.utterance_id,
-                        {"llm_started": False},
-                    )
-                    if state.get("partial_task") is None:
-                        task = asyncio.create_task(
-                            _start_response_from_partial_stt(
-                                segment_result.partial_audio,
-                                client_label,
-                                segment_result.utterance_id,
-                                sentence_queue,
-                                ai_state,
-                                state,
-                            )
-                        )
-                        state["partial_task"] = task
-                        response_tasks.add(task)
-                        task.add_done_callback(response_tasks.discard)
+                
 
                 if segment_result.segment_completed and segment_result.segment_audio:
                     state = utterance_states.setdefault(
