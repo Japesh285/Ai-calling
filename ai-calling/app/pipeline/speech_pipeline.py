@@ -286,20 +286,30 @@ async def process_transcript_to_reply_streaming(
 
     logger.info("LLM streaming started")
     response_buffer = ""
-    sentence_buffer = ""
+    chunk_buffer = ""
+    chunk_start_time = time.monotonic()
+    MIN_CHUNK_CHARS = 25
+    MAX_CHUNK_MS = 250
 
     async for token in stream_brain_response(transcript):
         response_buffer += token
-        sentence_buffer += token
+        chunk_buffer += token
 
-        completed_sentences, sentence_buffer = _extract_completed_sentences(sentence_buffer)
-        for sentence in completed_sentences:
+        elapsed_ms = (time.monotonic() - chunk_start_time) * 1000
+        should_flush = (
+            len(chunk_buffer) >= MIN_CHUNK_CHARS or
+            (len(chunk_buffer) >= 8 and elapsed_ms >= MAX_CHUNK_MS)
+        )
+
+        if should_flush and chunk_buffer.strip():
             logger.info("LLM chunk ready for TTS")
-            await sentence_queue.put(sentence)
+            await sentence_queue.put(chunk_buffer.strip())
+            chunk_buffer = ""
+            chunk_start_time = time.monotonic()
 
-    if sentence_buffer.strip():
+    if chunk_buffer.strip():
         logger.info("LLM chunk ready for TTS")
-        await sentence_queue.put(sentence_buffer.strip())
+        await sentence_queue.put(chunk_buffer.strip())
 
     response = response_buffer.strip()
     logger.info("AI response received: %s", response)

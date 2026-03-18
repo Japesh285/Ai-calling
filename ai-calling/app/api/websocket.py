@@ -138,10 +138,11 @@ def play_to_caller(uuid: str, pcma_audio: bytes) -> None:
             threading.Thread(target=delayed_delete, args=(temp_path,), daemon=True).start()
 
 
-def stop_ai_playback(call_uuid: str) -> None:
+def stop_ai_playback(call_uuid: str) -> bool:
     """
     Stop AI playback by breaking current audio playback.
     Uses uuid_break with 'both' direction to stop playback without hanging up.
+    Returns True if successful, False otherwise.
     """
     logger.info("Stopping AI playback for call_uuid=%s", call_uuid)
     command = [
@@ -154,7 +155,7 @@ def stop_ai_playback(call_uuid: str) -> None:
             command,
             capture_output=True,
             text=True,
-            timeout=2,
+            timeout=1,
             check=False,
         )
         stdout = (result.stdout or "").strip()
@@ -169,10 +170,14 @@ def stop_ai_playback(call_uuid: str) -> None:
                 call_uuid,
                 result.returncode,
             )
+            return False
+        return True
     except subprocess.TimeoutExpired:
         logger.error("Playback break command timed out for call_uuid=%s", call_uuid)
+        return False
     except Exception:
         logger.exception("Playback break failed for call_uuid=%s", call_uuid)
+        return False
 
 
 @router.websocket("/audio-stream")
@@ -419,30 +424,25 @@ async def _handle_barge_in(
     This function is fire-and-forget and should not block the main loop.
     """
     try:
-        # Increment generation to invalidate pending TTS/playout
-        ai_state["generation"] = int(ai_state["generation"]) + 1
+        old_generation = int(ai_state["generation"])
+        ai_state["generation"] = old_generation + 1
         ai_state["speaking"] = False
         ai_state["speaking_until"] = 0.0
         ai_state["playback_token"] = int(ai_state["playback_token"]) + 1
         ai_state["sentence_seq"] = 0
         playback_state["suppress_until"] = 0.0
-        
-        # Clear pending sentences and playback (non-blocking)
+
         _clear_sentence_queue(sentence_queue)
         _clear_playback_queue(playback_queue)
-        
-        # Stop AI playback in FreeSWITCH (blocking, run in executor)
-        # Use fire-and-forget pattern to avoid blocking
+
         loop = asyncio.get_event_loop()
         loop.run_in_executor(None, stop_ai_playback, call_uuid)
-        
-        # Cancel pending response generation tasks
+
         for response_task in list(response_tasks):
             if not response_task.done():
                 response_task.cancel()
         response_tasks.clear()
-        
-        # Reset segmenter for new speech
+
         segmenter.reset()
         logger.info("Barge-in handled successfully, listening resumed")
     except Exception:
@@ -593,6 +593,8 @@ async def _forward_sentence_chunks(
         sentence = await source_queue.get()
         if sentence is None:
             break
+        if int(ai_state["generation"]) != generation:
+            continue
         ai_state["sentence_seq"] = int(ai_state["sentence_seq"]) + 1
         await target_queue.put((generation, int(ai_state["sentence_seq"]), sentence))
 
@@ -632,13 +634,14 @@ async def _tts_generation_worker(
             break
 
         generation, sequence, sentence = item
-        if generation != int(ai_state["generation"]):
+        current_gen = int(ai_state["generation"])
+        if generation != current_gen:
             continue
         if len(sentence.strip()) < 2:
             continue
 
         pcm16_audio = await generate_tts(sentence)
-        if generation != int(ai_state["generation"]):
+        if int(ai_state["generation"]) != current_gen:
             continue
         if not pcm16_audio:
             logger.info("No TTS audio generated for %s", client_label)
@@ -646,13 +649,13 @@ async def _tts_generation_worker(
 
         logger.info("TTS chunk generated")
         pcma_audio = await convert_pcm16_bytes_to_pcma(pcm16_audio)
-        if generation != int(ai_state["generation"]):
+        if int(ai_state["generation"]) != current_gen:
             continue
         if not pcma_audio:
             logger.info("No PCMA audio generated for %s", client_label)
             continue
 
-        await playback_queue.put((generation, sequence, pcma_audio))
+        await playback_queue.put((current_gen, sequence, pcma_audio))
 
 
 async def _stream_playback_worker(
@@ -686,8 +689,11 @@ async def _stream_playback_worker(
         pending_audio[sequence] = pcma_audio
         while next_sequence in pending_audio:
             current_audio = pending_audio.pop(next_sequence)
-            if generation != int(ai_state["generation"]):
+            gen_at_playback = int(ai_state["generation"])
+            if generation != gen_at_playback:
                 pending_audio.clear()
+                break
+            if not ai_state["speaking"] and gen_at_playback != generation:
                 break
 
             playback_seconds = (len(current_audio) / PCMA_FRAME_BYTES) * 0.02
@@ -703,7 +709,7 @@ async def _stream_playback_worker(
             playback_token = int(ai_state["playback_token"])
 
             async with PLAYBACK_LOCK:
-                if generation != int(ai_state["generation"]):
+                if int(ai_state["generation"]) != generation:
                     pending_audio.clear()
                     break
                 await asyncio.to_thread(play_to_caller, call_uuid, current_audio)
