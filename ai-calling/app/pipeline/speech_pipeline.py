@@ -35,8 +35,8 @@ logger = get_logger(__name__)
 class SegmentationResult:
     segment_completed: bool = False
     segment_audio: bytes = b""
-    partial_stt_triggered: bool = False
-    partial_audio: bytes = b""
+    streaming_stt_triggered: bool = False
+    streaming_audio: bytes = b""
     speech_started: bool = False
     speech_stopped: bool = False
     utterance_id: int = 0
@@ -50,8 +50,9 @@ class SpeechSegmenter:
         self._speech_ms = 0
         self._silence_frames = 0
         self._speech_started_at: float | None = None
-        self._partial_stt_sent = False
+        self._streaming_sent = False
         self._utterance_id = 0
+        self._stream_buffer = bytearray()
 
     def reset(self) -> None:
         self._buffer.clear()
@@ -59,7 +60,8 @@ class SpeechSegmenter:
         self._speech_ms = 0
         self._silence_frames = 0
         self._speech_started_at = None
-        self._partial_stt_sent = False
+        self._streaming_sent = False
+        self._stream_buffer.clear()
 
     def process_frame(self, frame: bytes) -> SegmentationResult:
         rms = audioop.rms(frame, PCM_SAMPLE_WIDTH_BYTES) if frame else 0
@@ -71,10 +73,11 @@ class SpeechSegmenter:
             if is_speech_start:
                 self._state = "speech"
                 self._buffer.extend(frame)
+                self._stream_buffer.extend(frame)
                 self._speech_ms = FRAME_DURATION_MS
                 self._silence_frames = 0
                 self._speech_started_at = time.monotonic()
-                self._partial_stt_sent = False
+                self._streaming_sent = False
                 self._utterance_id += 1
                 result.speech_started = True
                 result.utterance_id = self._utterance_id
@@ -83,17 +86,20 @@ class SpeechSegmenter:
 
         result.utterance_id = self._utterance_id
         self._buffer.extend(frame)
+        self._stream_buffer.extend(frame)
         self._speech_ms += FRAME_DURATION_MS
 
+        # Trigger streaming STT every ~500ms of speech for incremental updates
         if (
             self._speech_started_at is not None
-            and not self._partial_stt_sent
-            and time.monotonic() - self._speech_started_at > 1.0
+            and not self._streaming_sent
+            and time.monotonic() - self._speech_started_at >= 0.5
         ):
-            result.partial_stt_triggered = True
-            result.partial_audio = bytes(self._buffer)
-            self._partial_stt_sent = True
-            logger.info("Partial STT triggered")
+            result.streaming_stt_triggered = True
+            result.streaming_audio = bytes(self._stream_buffer)
+            self._streaming_sent = True
+            self._stream_buffer.clear()
+            logger.info("Streaming STT triggered")
 
         if is_speech_stop:
             self._silence_frames += 1
@@ -151,6 +157,43 @@ def _pcm_to_wav_bytes(pcm_bytes: bytes) -> bytes:
         wav_file.setframerate(PCM_SAMPLE_RATE)
         wav_file.writeframes(pcm_bytes)
     return buffer.getvalue()
+
+
+async def transcribe_audio_streaming(audio_chunk: bytes) -> str:
+    """
+    Stream audio chunk to STT worker for incremental transcription.
+    Uses the streaming endpoint for real-time updates.
+    """
+    if not audio_chunk:
+        return ""
+
+    worker = STT_WORKERS[0]
+    wav_bytes = _pcm_to_wav_bytes(audio_chunk)
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            async with client.stream(
+                "POST",
+                f"{worker}/stream",
+                content=io.BytesIO(wav_bytes),
+                headers={"Content-Type": "audio/wav"},
+            ) as response:
+                response.raise_for_status()
+                latest_transcript = ""
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data = line[6:]
+                        if data == "[DONE]":
+                            break
+                        if data.startswith("error: "):
+                            logger.error("Streaming STT error: %s", data[7:])
+                            continue
+                        latest_transcript = data
+
+                return latest_transcript
+    except httpx.HTTPError as exc:
+        logger.exception("Streaming STT request failed: %s", exc)
+        return ""
 
 
 async def transcribe_audio(audio_bytes: bytes) -> str:

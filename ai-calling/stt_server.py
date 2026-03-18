@@ -2,6 +2,7 @@ import io
 import wave
 
 from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 
 from app.stt.faster_whisper_stt import FasterWhisperSTT
 
@@ -29,3 +30,38 @@ async def transcribe(audio: UploadFile):
 
     text = stt.transcribe(pcm_bytes)
     return {"text": text, "language": stt.last_detected_language}
+
+
+@app.post("/transcribe/stream")
+async def transcribe_stream(audio: UploadFile):
+    """
+    Streaming transcription endpoint.
+    Accepts raw PCM audio chunks and returns incremental transcriptions.
+    """
+    stt.init_stream()
+
+    async def generate_transcripts():
+        try:
+            async for chunk in audio.stream():
+                if not chunk:
+                    continue
+
+                transcript = stt.stream_transcribe(chunk)
+                if transcript:
+                    yield f"data: {transcript}\n\n"
+        except Exception as exc:
+            yield f"error: {exc}\n\n"
+        finally:
+            final_transcript = stt.finalize_stream()
+            if final_transcript:
+                yield f"data: {final_transcript}\n\n"
+            yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate_transcripts(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+    )
