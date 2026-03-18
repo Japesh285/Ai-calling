@@ -280,26 +280,6 @@ async def audio_stream(ws: WebSocket) -> None:
                     # Continue processing this frame as part of new speech
                     # Don't skip it - let it be processed for the new utterance
 
-                # Handle streaming STT for incremental transcription
-                if segment_result.streaming_stt_triggered and segment_result.streaming_audio:
-                    state = utterance_states.setdefault(
-                        segment_result.utterance_id,
-                        {"llm_started": False},
-                    )
-                    if not state.get("llm_started"):
-                        task = asyncio.create_task(
-                            _process_streaming_segment(
-                                segment_result.streaming_audio,
-                                client_label,
-                                segment_result.utterance_id,
-                                sentence_queue,
-                                ai_state,
-                                state,
-                            )
-                        )
-                        segment_tasks.add(task)
-                        task.add_done_callback(segment_tasks.discard)
-
                 # Handle final segment completion
                 if segment_result.segment_completed and segment_result.segment_audio:
                     state = utterance_states.setdefault(
@@ -430,7 +410,9 @@ async def _handle_barge_in(
         ai_state["speaking_until"] = 0.0
         ai_state["playback_token"] = int(ai_state["playback_token"]) + 1
         ai_state["sentence_seq"] = 0
-        playback_state["suppress_until"] = 0.0
+        
+        # Prevent race condition: suppress frames briefly after barge-in
+        playback_state["suppress_until"] = time.monotonic() + 0.1
 
         _clear_sentence_queue(sentence_queue)
         _clear_playback_queue(playback_queue)
@@ -595,6 +577,9 @@ async def _forward_sentence_chunks(
             break
         if int(ai_state["generation"]) != generation:
             continue
+        # Filter out too-short sentences before queuing for TTS
+        if len(sentence.strip()) < 10:
+            continue
         ai_state["sentence_seq"] = int(ai_state["sentence_seq"]) + 1
         await target_queue.put((generation, int(ai_state["sentence_seq"]), sentence))
 
@@ -637,7 +622,8 @@ async def _tts_generation_worker(
         current_gen = int(ai_state["generation"])
         if generation != current_gen:
             continue
-        if len(sentence.strip()) < 2:
+        # Filter out too-short sentences
+        if len(sentence.strip()) < 10:
             continue
 
         pcm16_audio = await generate_tts(sentence)

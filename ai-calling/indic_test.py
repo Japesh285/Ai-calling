@@ -1,35 +1,42 @@
 import torch
+import numpy as np
 import soundfile as sf
-from transformers import AutoTokenizer
-from parler_tts import ParlerTTSForConditionalGeneration
+from transformers import AutoModel
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-model_name = "ai4bharat/indic-parler-tts"
-
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(model_name)
+# Correct repo ID (IMPORTANT)
+repo_id = "ai4bharat/IndicF5"
 
 print("Loading model...")
-model = ParlerTTSForConditionalGeneration.from_pretrained(model_name).to(device)
+model = AutoModel.from_pretrained(
+    repo_id,
+    trust_remote_code=True
+).to(device)
 
 print("Model loaded.")
 
-description = "A clear female voice speaking Hindi."
-prompt = "नमस्ते आपका स्वागत है"
+# Your input text
+text = "नमस्ते आपका स्वागत है"
 
-input_ids = tokenizer(description, return_tensors="pt").input_ids.to(device)
-prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+# VERY IMPORTANT: you NEED a reference audio
+ref_audio_path = "prompt.wav"   # <-- you must provide this
+ref_text = "नमस्ते आप कैसे हैं"
 
 print("Generating audio...")
 
-generation = model.generate(
-    input_ids=input_ids,
-    prompt_input_ids=prompt_ids
-)
+with torch.inference_mode():
+    audio = model(
+        text,
+        ref_audio_path=ref_audio_path,
+        ref_text=ref_text
+    )
 
-audio = generation.cpu().numpy().squeeze()
+# Normalize if needed
+if audio.dtype == np.int16:
+    audio = audio.astype(np.float32) / 32768.0
 
-sf.write("output.wav", audio, 24000)
+# Save
+sf.write("output.wav", np.array(audio, dtype=np.float32), 24000)
 
-print("Done! Audio saved as output.wav")
+print("Done! Audio saved.")

@@ -30,6 +30,12 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+# Deduplication and state tracking
+_last_transcript = ""
+_llm_in_progress = False
+_last_speech_time = 0.0
+_stt_request_time = 0.0
+
 
 @dataclass(slots=True)
 class SegmentationResult:
@@ -196,24 +202,45 @@ async def transcribe_audio_streaming(audio_chunk: bytes) -> str:
         return ""
 
 
-async def transcribe_audio(audio_bytes: bytes) -> str:
+async def transcribe_audio(audio_bytes: bytes, is_final_transcript: bool = True) -> str:
+    global _last_transcript, _stt_request_time
     if not audio_bytes:
         return ""
+
+    # Only process final transcripts for LLM triggering
+    if not is_final_transcript:
+        return ""
+
+    _stt_request_time = time.monotonic()
+    logger.info("STT request sent at %.3f", _stt_request_time)
 
     worker = STT_WORKERS[0]
     wav_bytes = _pcm_to_wav_bytes(audio_bytes)
     files = {"audio": ("audio.wav", wav_bytes, "audio/wav")}
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=10.0) as client:
         response = await client.post(worker, files=files)
         response.raise_for_status()
         data = response.json()
 
     text = data.get("text") if isinstance(data, dict) else ""
-    transcript = str(text or "").strip()
-    if transcript:
-        logger.info("Speech chunk sent to STT")
-    logger.info("STT transcript: %s", transcript)
+    transcript = str(text or "").strip().lower()
+
+    # Ignore system/garbage text
+    if "the following conversation may contain" in transcript:
+        return ""
+
+    # Ignore invalid or too-short transcripts
+    if len(transcript) < 4 or transcript in {"", ".", "i", "uh", "um"}:
+        return ""
+
+    # Deduplicate transcripts
+    if transcript == _last_transcript:
+        return ""
+    _last_transcript = transcript
+
+    elapsed_ms = (time.monotonic() - _stt_request_time) * 1000
+    logger.info("STT transcript received in %.0fms: %s", elapsed_ms, transcript)
     return transcript
 
 
@@ -255,65 +282,139 @@ async def process_speech_segment(audio_bytes: bytes) -> None:
 
 
 async def process_speech_segment_to_reply(audio_bytes: bytes) -> tuple[str, str]:
+    global _last_transcript, _llm_in_progress, _last_speech_time
+    speech_stop_time = time.monotonic()
+    logger.info("Speech stop detected at %.3f", speech_stop_time)
+    
     transcript = await transcribe_audio(audio_bytes)
     if not transcript:
         return "", ""
 
-    response = await ask_brain(transcript)
-    await _append_brain_response(transcript, response)
-    return transcript, response
+    # Prevent multiple LLM calls
+    if _llm_in_progress:
+        logger.info("LLM already in progress, skipping duplicate")
+        return "", ""
+
+    # Reduced cooldown check (0.5s → 0.1s for faster response)
+    now = time.monotonic()
+    if now - _last_speech_time < 0.1:
+        logger.info("Speech segment too soon, skipping")
+        return "", ""
+    _last_speech_time = now
+
+    _llm_in_progress = True
+    try:
+        response = await ask_brain(transcript)
+        await _append_brain_response(transcript, response)
+        return transcript, response
+    finally:
+        _llm_in_progress = False
 
 
 async def process_speech_segment_to_reply_streaming(
     audio_bytes: bytes,
     sentence_queue: asyncio.Queue[str | None],
 ) -> tuple[str, str]:
+    global _last_transcript, _llm_in_progress, _last_speech_time
+    speech_stop_time = time.monotonic()
+    logger.info("Speech stop detected at %.3f", speech_stop_time)
+    
     transcript = await transcribe_audio(audio_bytes)
     if not transcript:
         return "", ""
 
-    response = await process_transcript_to_reply_streaming(transcript, sentence_queue)
-    await _append_brain_response(transcript, response)
-    return transcript, response
+    # Prevent multiple LLM calls
+    if _llm_in_progress:
+        logger.info("LLM already in progress, skipping duplicate")
+        return "", ""
+
+    # Reduced cooldown check (0.5s → 0.1s for faster response)
+    now = time.monotonic()
+    if now - _last_speech_time < 0.1:
+        logger.info("Speech segment too soon, skipping")
+        return "", ""
+    _last_speech_time = now
+
+    _llm_in_progress = True
+    try:
+        response = await process_transcript_to_reply_streaming(transcript, sentence_queue)
+        await _append_brain_response(transcript, response)
+        return transcript, response
+    finally:
+        _llm_in_progress = False
 
 
 async def process_transcript_to_reply_streaming(
     transcript: str,
     sentence_queue: asyncio.Queue[str | None],
 ) -> str:
+    global _llm_in_progress, _last_speech_time
     if not transcript:
         return ""
 
-    logger.info("LLM streaming started")
-    response_buffer = ""
-    chunk_buffer = ""
-    chunk_start_time = time.monotonic()
-    MIN_CHUNK_CHARS = 25
-    MAX_CHUNK_MS = 250
+    # Prevent multiple LLM calls
+    if _llm_in_progress:
+        logger.info("LLM already in progress, skipping duplicate")
+        return ""
 
-    async for token in stream_brain_response(transcript):
-        response_buffer += token
-        chunk_buffer += token
+    # Segment cooldown check
+    now = time.monotonic()
+    if now - _last_speech_time < 0.5:
+        logger.info("Speech segment too soon, skipping")
+        return ""
+    _last_speech_time = now
 
-        elapsed_ms = (time.monotonic() - chunk_start_time) * 1000
-        should_flush = (
-            len(chunk_buffer) >= MIN_CHUNK_CHARS or
-            (len(chunk_buffer) >= 8 and elapsed_ms >= MAX_CHUNK_MS)
-        )
+    _llm_in_progress = True
+    try:
+        logger.info("LLM streaming started")
+        response_buffer = ""
+        chunk_buffer = ""
+        chunk_start_time = time.monotonic()
+        MIN_CHUNK_CHARS = 50
+        MAX_CHUNK_MS = 300
 
-        if should_flush and chunk_buffer.strip():
+        def _is_safe_chunk_boundary(text: str) -> bool:
+            """Check if text ends at a safe boundary (space or punctuation)."""
+            if not text:
+                return False
+            last_char = text[-1]
+            return last_char.isspace() or last_char in {".", "!", "?", ",", ";", ":", ")", "]", "\"", "'"}
+
+        async for token in stream_brain_response(transcript):
+            response_buffer += token
+            chunk_buffer += token
+
+            elapsed_ms = (time.monotonic() - chunk_start_time) * 1000
+            should_flush = (
+                len(chunk_buffer) >= MIN_CHUNK_CHARS
+                or (len(chunk_buffer) >= 20 and elapsed_ms >= MAX_CHUNK_MS)
+            )
+
+            if should_flush and chunk_buffer.strip():
+                # Find last safe boundary to avoid breaking mid-word
+                flush_text = chunk_buffer
+                if not _is_safe_chunk_boundary(chunk_buffer):
+                    # Look backwards for last safe boundary
+                    for i in range(len(chunk_buffer) - 1, max(0, len(chunk_buffer) - 20), -1):
+                        if _is_safe_chunk_boundary(chunk_buffer[i]):
+                            flush_text = chunk_buffer[:i + 1]
+                            break
+
+                if flush_text.strip():
+                    logger.info("LLM chunk ready for TTS")
+                    await sentence_queue.put(flush_text.strip())
+                    chunk_buffer = chunk_buffer[len(flush_text):]
+                    chunk_start_time = time.monotonic()
+
+        if chunk_buffer.strip():
             logger.info("LLM chunk ready for TTS")
             await sentence_queue.put(chunk_buffer.strip())
-            chunk_buffer = ""
-            chunk_start_time = time.monotonic()
 
-    if chunk_buffer.strip():
-        logger.info("LLM chunk ready for TTS")
-        await sentence_queue.put(chunk_buffer.strip())
-
-    response = response_buffer.strip()
-    logger.info("AI response received: %s", response)
-    return response
+        response = response_buffer.strip()
+        logger.info("AI response received: %s", response)
+        return response
+    finally:
+        _llm_in_progress = False
 
 
 async def append_brain_response(transcript: str, response: str) -> None:

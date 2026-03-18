@@ -83,7 +83,10 @@ async def synthesize(text: str) -> Optional[bytes]:
     worker = TTS_WORKERS[_tts_worker_index % len(TTS_WORKERS)]
     _tts_worker_index += 1
     async with httpx.AsyncClient(timeout=180.0) as client:
-        response = await client.post(worker, json={"text": clean_text})
+        response = await client.post(
+            worker,
+            json={"text": clean_text, "language": "en"}
+        )
         response.raise_for_status()
         raw_audio = response.content
 

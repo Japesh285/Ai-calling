@@ -1,15 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import audioop
 import base64
 import json
-from pathlib import Path
-import tempfile
-import wave
 
 from fastapi import WebSocket
 
-from app.config.settings import FRAME_DURATION_MS, PCM_CHANNELS, PCM_SAMPLE_RATE, PCM_SAMPLE_WIDTH_BYTES, PCMA_FRAME_BYTES
+from app.config.settings import FRAME_DURATION_MS, PCM_SAMPLE_RATE, PCMA_FRAME_BYTES
 from app.utils.logger import get_logger
 from app.workers.tts_pool import synthesize
 
@@ -24,80 +22,24 @@ async def generate_tts(text: str) -> bytes:
     return pcm16
 
 
-def _write_pcm16_wav(pcm16_bytes: bytes, output_path: Path) -> None:
-    with wave.open(str(output_path), "wb") as wav_file:
-        wav_file.setnchannels(PCM_CHANNELS)
-        wav_file.setsampwidth(PCM_SAMPLE_WIDTH_BYTES)
-        wav_file.setframerate(PCM_SAMPLE_RATE)
-        wav_file.writeframes(pcm16_bytes)
-
-
-async def convert_to_pcma(pcm16_wav_path: str) -> bytes:
-    if not pcm16_wav_path:
+def _convert_pcm16_to_pcma(pcm16_bytes: bytes) -> bytes:
+    """Convert PCM16 (16kHz) to PCMA (8kHz) using audioop - no ffmpeg, no disk I/O."""
+    if not pcm16_bytes:
         return b""
 
-    with tempfile.NamedTemporaryFile(suffix=".alaw", delete=False) as output_file:
-        output_path = Path(output_file.name)
-
-    process = await asyncio.create_subprocess_exec(
-        "ffmpeg",
-        "-y",
-        "-nostdin",
-        "-v",
-        "error",
-        "-i",
-        pcm16_wav_path,
-        "-ar",
-        "8000",
-        "-ac",
-        "1",
-        "-acodec",
-        "pcm_alaw",
-        "-f",
-        "alaw",
-        str(output_path),
-        stderr=asyncio.subprocess.PIPE,
-    )
-    _, stderr = await process.communicate()
-
-    if process.returncode != 0:
-        logger.error(
-            "ffmpeg PCMA conversion failed with code %s: %s",
-            process.returncode,
-            (stderr or b"").decode(errors="replace").strip(),
-        )
-        return b""
-
-    file_process = await asyncio.create_subprocess_exec(
-        "file",
-        str(output_path),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    file_stdout, _ = await file_process.communicate()
-    if file_stdout:
-        logger.info("file %s", file_stdout.decode(errors="replace").strip())
-
-    pcma_bytes = output_path.read_bytes()
-    output_path.unlink(missing_ok=True)
-    logger.info("TTS converted to PCMA")
+    # Downsample from 16kHz to 8kHz
+    pcm16_8k, _ = audioop.ratecv(pcm16_bytes, 2, 1, PCM_SAMPLE_RATE, 8000, None)
+    # Convert PCM16 to A-law
+    pcma_bytes = audioop.lin2alaw(pcm16_8k, 2)
+    logger.info("TTS converted to PCMA (in-memory)")
     logger.info("PCMA size: %s", len(pcma_bytes))
     logger.info("Frames to stream: %s", len(pcma_bytes) // PCMA_FRAME_BYTES)
     return pcma_bytes
 
 
 async def convert_pcm16_bytes_to_pcma(pcm16_bytes: bytes) -> bytes:
-    if not pcm16_bytes:
-        return b""
-
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as wav_file:
-        wav_path = Path(wav_file.name)
-
-    _write_pcm16_wav(pcm16_bytes, wav_path)
-    try:
-        return await convert_to_pcma(str(wav_path))
-    finally:
-        wav_path.unlink(missing_ok=True)
+    """In-memory PCM16 to PCMA conversion."""
+    return _convert_pcm16_to_pcma(pcm16_bytes)
 
 
 def _build_stream_audio_message(frame: bytes) -> dict[str, object]:

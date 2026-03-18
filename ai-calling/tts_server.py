@@ -22,7 +22,6 @@ def _load_tts() -> TTS:
 
 class SynthesizeRequest(BaseModel):
     text: str
-    speaker: str = "Ana Florence"
     language: str = "en"
 
 
@@ -30,16 +29,41 @@ app = FastAPI(title="TTS Worker")
 tts_model = _load_tts()
 tts_model_lock = threading.Lock()
 
+# Reference audio file for voice cloning
+DEFAULT_SPEAKER_WAV = "/home/developer/ai-calling/abhishek_reference.wav"
+
+
+def _warmup_model(tts: TTS, speaker_wav_path: str) -> None:
+    """Run dummy inference to warm up model and avoid first-request latency spike."""
+    with tts_model_lock:
+        try:
+            tts.tts(text="Hello", speaker_wav=speaker_wav_path, language="en")
+            print("TTS model warmed up successfully")
+        except Exception as e:
+            print(f"TTS warmup failed: {e}")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Warm up model on startup."""
+    # Warm up model in background
+    threading.Thread(target=_warmup_model, args=(tts_model, DEFAULT_SPEAKER_WAV), daemon=True).start()
+
 
 @app.get("/")
 async def root() -> dict[str, str]:
     return {"status": "tts worker running"}
 
 
-def _synthesize_wav_bytes(text: str, speaker: str, language: str) -> bytes:
+def _synthesize_wav_bytes(text: str, language: str) -> bytes:
     # XTTS inference is not thread-safe when sharing one in-process model.
     with tts_model_lock:
-        wav = tts_model.tts(text=text, speaker=speaker, language=language)
+        # Use speaker_wav file for voice cloning
+        wav = tts_model.tts(
+            text=text,
+            speaker_wav=DEFAULT_SPEAKER_WAV,
+            language=language,
+        )
         buffer = io.BytesIO()
         tts_model.synthesizer.save_wav(wav=wav, path=buffer)
         return buffer.getvalue()
@@ -54,7 +78,6 @@ async def synthesize(payload: SynthesizeRequest) -> Response:
     wav_bytes = await asyncio.to_thread(
         _synthesize_wav_bytes,
         clean_text,
-        payload.speaker,
         payload.language,
     )
     if not wav_bytes:
