@@ -5,7 +5,6 @@ import re
 import numpy as np
 import torch
 from faster_whisper import WhisperModel
-from unidecode import unidecode
 
 from app.utils.logger import get_logger
 
@@ -48,7 +47,7 @@ class FasterWhisperSTT:
             beam_size=3,
             condition_on_previous_text=False,
             vad_filter=False,
-            initial_prompt="The following conversation may contain Hindi and English spoken by an Indian speaker.",
+            initial_prompt="नमस्ते। This conversation is with an Indian tax support assistant.",
         )
 
         self.last_detected_language = getattr(info, "language", "") or ""
@@ -58,8 +57,7 @@ class FasterWhisperSTT:
         logger.info("Detected language: %s", self.last_detected_language)
 
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-        text = unidecode(text)
-        text = re.sub(r"\s+", " ", text).lower().strip()
+        text = re.sub(r"\s+", " ", text).strip()
 
         logger.info("Transcript result: %s", text)
         return text
@@ -94,7 +92,7 @@ class FasterWhisperSTT:
             beam_size=1,
             condition_on_previous_text=True,
             vad_filter=False,
-            initial_prompt="The following conversation may contain Hindi and English spoken by an Indian speaker.",
+            initial_prompt="नमस्ते। This conversation is with an Indian tax support assistant.",
             without_timestamps=True,
         )
 
@@ -103,8 +101,7 @@ class FasterWhisperSTT:
             self._stream_language = "hi"
 
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-        text = unidecode(text)
-        text = re.sub(r"\s+", " ", text).lower().strip()
+        text = re.sub(r"\s+", " ", text).strip()
 
         # Keep last 2 seconds for context continuity
         keep_samples = int(32000)  # 2 seconds at 16kHz
@@ -125,7 +122,7 @@ class FasterWhisperSTT:
             beam_size=3,
             condition_on_previous_text=False,
             vad_filter=False,
-            initial_prompt="The following conversation may contain Hindi and English spoken by an Indian speaker.",
+            initial_prompt="नमस्ते। This conversation is with an Indian tax support assistant.",
         )
 
         self.last_detected_language = getattr(info, "language", "") or ""
@@ -134,8 +131,7 @@ class FasterWhisperSTT:
             self.last_detected_language = "hi"
 
         text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-        text = unidecode(text)
-        text = re.sub(r"\s+", " ", text).lower().strip()
+        text = re.sub(r"\s+", " ", text).strip()
 
         self._stream_buffer = None
         return text

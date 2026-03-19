@@ -14,8 +14,8 @@ from app.workers.tts_pool import synthesize
 logger = get_logger(__name__)
 
 
-async def generate_tts(text: str) -> bytes:
-    pcm16 = await synthesize(text)
+async def generate_tts(text: str, language: str | None = None) -> bytes:
+    pcm16 = await synthesize(text, language)
     if not pcm16:
         return b""
     logger.info("TTS generated")

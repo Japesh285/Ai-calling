@@ -20,6 +20,7 @@ webrtcvad
 
 # TTS
 TTS
+torchaudio
 
 # Async networking
 aiohttp

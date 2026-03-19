@@ -378,7 +378,8 @@ async def process_transcript_to_reply_streaming(
             if not text:
                 return False
             last_char = text[-1]
-            return last_char.isspace() or last_char in {".", "!", "?", ",", ";", ":", ")", "]", "\"", "'"}
+            # "।" = Devanagari danda (Hindi sentence end), "?" = Hindi question mark
+            return last_char.isspace() or last_char in {".", "!", "?", ",", ";", ":", ")", "]", "\"", "'", "।", "॥", "?"}
 
         async for token in stream_brain_response(transcript):
             response_buffer += token
@@ -426,7 +427,7 @@ def _extract_completed_sentences(buffer: str) -> tuple[list[str], str]:
     sentence_start = 0
 
     for index, char in enumerate(buffer):
-        if char in {".", "!", "?"}:
+        if char in {".", "!", "?", "।", "॥", "?"}:  # includes Devanagari danda
             sentence = buffer[sentence_start : index + 1].strip()
             if sentence:
                 completed_sentences.append(sentence)

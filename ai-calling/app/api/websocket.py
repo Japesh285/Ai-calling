@@ -14,13 +14,13 @@ import wave
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.audio.tts_streamer import (
-    convert_pcm16_bytes_to_pcma,
     generate_tts,
 )
 from app.config.settings import (
     FREESWITCH_AUDIO_DUMP_DIR,
     FREESWITCH_RAW_DUMP_DIR,
     PCM_CHANNELS,
+    PCM_FRAME_BYTES,
     PCMA_FRAME_BYTES,
     PCM_SAMPLE_RATE,
     PCM_SAMPLE_WIDTH_BYTES,
@@ -71,14 +71,14 @@ def _dump_raw_audio(audio_bytes: bytes) -> Path | None:
     return output_path
 
 
-def play_to_caller(uuid: str, pcma_audio: bytes) -> None:
+def play_to_caller(uuid: str, pcm16_audio: bytes) -> None:
     if not uuid:
         raise ValueError("Call UUID is required for playback")
-    if not pcma_audio:
-        raise ValueError("PCMA audio is required for playback")
+    if not pcm16_audio:
+        raise ValueError("PCM16 audio is required for playback")
 
-    def delayed_delete(path: str) -> None:
-        time.sleep(5)
+    def delayed_delete(path: str, delay: float) -> None:
+        time.sleep(delay)
         try:
             os.unlink(path)
         except Exception:
@@ -86,8 +86,6 @@ def play_to_caller(uuid: str, pcma_audio: bytes) -> None:
 
     temp_path: str | None = None
     try:
-        pcm16_audio = audioop.alaw2lin(pcma_audio, 2)
-
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
             temp_path = handle.name
 
@@ -126,16 +124,22 @@ def play_to_caller(uuid: str, pcma_audio: bytes) -> None:
                 temp_path,
             )
 
+        # Keep file alive long enough for FreeSWITCH to play it.
+        # All chunks are broadcast nearly simultaneously but play sequentially —
+        # a later chunk's file must survive while all earlier chunks play.
+        # Use 3× audio duration (min 30s) as a safe margin.
+        audio_seconds = len(pcm16_audio) / (8000 * 2)
+        delete_delay = max(30.0, audio_seconds * 3)
         if temp_path:
-            threading.Thread(target=delayed_delete, args=(temp_path,), daemon=True).start()
+            threading.Thread(target=delayed_delete, args=(temp_path, delete_delay), daemon=True).start()
     except subprocess.TimeoutExpired:
         logger.error("Playback command timed out for call_uuid=%s", uuid)
         if temp_path:
-            threading.Thread(target=delayed_delete, args=(temp_path,), daemon=True).start()
+            threading.Thread(target=delayed_delete, args=(temp_path, 30.0), daemon=True).start()
     except Exception:
         logger.exception("Playback failed for call_uuid=%s", uuid)
         if temp_path:
-            threading.Thread(target=delayed_delete, args=(temp_path,), daemon=True).start()
+            threading.Thread(target=delayed_delete, args=(temp_path, 30.0), daemon=True).start()
 
 
 def stop_ai_playback(call_uuid: str) -> bool:
@@ -145,10 +149,13 @@ def stop_ai_playback(call_uuid: str) -> bool:
     Returns True if successful, False otherwise.
     """
     logger.info("Stopping AI playback for call_uuid=%s", call_uuid)
+    # Do NOT use "both" — it breaks all queued apps including sleep(300000)
+    # which would cause the dialplan to end and hang up the call.
+    # Plain uuid_break only stops the current playback (depth=1 uuid_broadcast).
     command = [
         "/usr/local/freeswitch/bin/fs_cli",
         "-x",
-        f"uuid_break {call_uuid} both",
+        f"uuid_break {call_uuid}",
     ]
     try:
         result = subprocess.run(
@@ -206,6 +213,10 @@ async def audio_stream(ws: WebSocket) -> None:
     ai_state = {
         "speaking": False,
         "speaking_until": 0.0,
+        # Tracks when the raw audio finishes playing (no guard buffer).
+        # uuid_break is ONLY safe to call before this time — after it, sleep(300000)
+        # becomes the current FreeSWITCH application and uuid_break would kill the call.
+        "playback_ends_at": 0.0,
         "generation": 0,
         "playback_token": 0,
         "sentence_seq": 0,
@@ -411,21 +422,36 @@ async def _handle_barge_in(
         ai_state["playback_token"] = int(ai_state["playback_token"]) + 1
         ai_state["sentence_seq"] = 0
         
-        # Prevent race condition: suppress frames briefly after barge-in
-        playback_state["suppress_until"] = time.monotonic() + 0.1
+        # Clear suppression immediately so user speech after barge-in flows through.
+        # The old suppress_until was set during AI playback and could be 600ms+
+        # in the future. Keeping it would silently reset the segmenter on every
+        # frame for that window, erasing the user's utterance and producing no response.
+        playback_state["suppress_until"] = 0.0
+        playback_state["pure_audio_end"] = 0.0
 
         _clear_sentence_queue(sentence_queue)
         _clear_playback_queue(playback_queue)
 
-        loop = asyncio.get_event_loop()
-        loop.run_in_executor(None, stop_ai_playback, call_uuid)
+        # Do NOT send uuid_break on barge-in.
+        #
+        # uuid_break during a uuid_broadcast creates a race condition in FreeSWITCH:
+        # breaking a depth=1 broadcast can signal the depth=0 sleep(300000) to wake,
+        # advancing the dialplan past its last instruction and hanging up the call.
+        #
+        # Python's playback queue is already cleared above — no new chunks will be
+        # broadcast.  The chunk currently playing in FreeSWITCH will finish naturally
+        # (at most 1-2 s) and FreeSWITCH will return to sleep(300000) on its own.
+        # This is safe and avoids the drop entirely.
 
         for response_task in list(response_tasks):
             if not response_task.done():
                 response_task.cancel()
         response_tasks.clear()
 
-        segmenter.reset()
+        # Do NOT reset the segmenter here.
+        # The speech frames that triggered barge-in are already in the segmenter buffer.
+        # Resetting would erase the user's utterance, so segment_completed never fires
+        # and the system never responds. Let the buffer accumulate naturally.
         logger.info("Barge-in handled successfully, listening resumed")
     except Exception:
         logger.exception("Barge-in handling failed")
@@ -626,22 +652,15 @@ async def _tts_generation_worker(
         if len(sentence.strip()) < 10:
             continue
 
-        pcm16_audio = await generate_tts(sentence)
+        pcm16_audio = await generate_tts(sentence, language=None)
         if int(ai_state["generation"]) != current_gen:
             continue
         if not pcm16_audio:
             logger.info("No TTS audio generated for %s", client_label)
             continue
 
-        logger.info("TTS chunk generated")
-        pcma_audio = await convert_pcm16_bytes_to_pcma(pcm16_audio)
-        if int(ai_state["generation"]) != current_gen:
-            continue
-        if not pcma_audio:
-            logger.info("No PCMA audio generated for %s", client_label)
-            continue
-
-        await playback_queue.put((current_gen, sequence, pcma_audio))
+        logger.info("TTS chunk generated, queuing PCM16 for playback")
+        await playback_queue.put((current_gen, sequence, pcm16_audio))
 
 
 async def _stream_playback_worker(
@@ -660,7 +679,7 @@ async def _stream_playback_worker(
         if item is None:
             break
 
-        generation, sequence, pcma_audio = item
+        generation, sequence, pcm16_audio = item
         current_generation = int(ai_state["generation"])
         if generation > playback_generation:
             playback_generation = generation
@@ -672,7 +691,7 @@ async def _stream_playback_worker(
                 next_sequence = 1
             continue
 
-        pending_audio[sequence] = pcma_audio
+        pending_audio[sequence] = pcm16_audio
         while next_sequence in pending_audio:
             current_audio = pending_audio.pop(next_sequence)
             gen_at_playback = int(ai_state["generation"])
@@ -682,15 +701,22 @@ async def _stream_playback_worker(
             if not ai_state["speaking"] and gen_at_playback != generation:
                 break
 
-            playback_seconds = (len(current_audio) / PCMA_FRAME_BYTES) * 0.02
-            speaking_until = (
-                max(playback_state["suppress_until"], time.monotonic())
-                + playback_seconds
-                + (TTS_PLAYBACK_GUARD_MS / 1000.0)
-            )
+            playback_seconds = (len(current_audio) / PCM_FRAME_BYTES) * 0.02
+            now = time.monotonic()
+            audio_end = max(playback_state["suppress_until"], now) + playback_seconds
+            speaking_until = audio_end + (TTS_PLAYBACK_GUARD_MS / 1000.0)
             playback_state["suppress_until"] = speaking_until
             ai_state["speaking"] = True
             ai_state["speaking_until"] = speaking_until
+
+            # Track pure audio end WITHOUT guard accumulation.
+            # suppress_until carries guard time from every preceding chunk, so using
+            # it here would make playback_ends_at overestimate by N×guard_ms — causing
+            # uuid_break to fire after actual audio ends and hit sleep(300000).
+            pure_audio_end = playback_state.get("pure_audio_end", now)
+            pure_chunk_end = max(pure_audio_end, now) + playback_seconds
+            playback_state["pure_audio_end"] = pure_chunk_end
+            ai_state["playback_ends_at"] = pure_chunk_end
             ai_state["playback_token"] = int(ai_state["playback_token"]) + 1
             playback_token = int(ai_state["playback_token"])
 
@@ -713,6 +739,7 @@ async def _mark_playback_complete(
     await asyncio.sleep(delay_seconds)
     if playback_token == int(ai_state["playback_token"]):
         ai_state["speaking"] = False
+        ai_state["playback_ends_at"] = 0.0
 
 
 async def _save_inbound_audio_dump(session: CallSession) -> Path | None:
