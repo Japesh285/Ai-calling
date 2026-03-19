@@ -20,12 +20,12 @@ PCMA_FRAME_BYTES = 160
 # Realtime inbound audio and voice segmentation
 PCM_FRAME_BYTES = 320
 FRAME_DURATION_MS = 20
-SPEECH_START_RMS_THRESHOLD = 250
-SPEECH_STOP_RMS_THRESHOLD = 150
-SILENCE_STOP_FRAMES = 10
+SPEECH_START_RMS_THRESHOLD = 400      # Reject background noise (was 250)
+SPEECH_STOP_RMS_THRESHOLD = 200       # Faster silence detection (was 150)
+SILENCE_STOP_FRAMES = 6               # 120ms silence = stop (was 10 = 200ms)
 SILENCE_TIMEOUT_MS = 300
 MAX_SPEECH_LENGTH_MS = 10_000
-MIN_SPEECH_LENGTH_MS = 300
+MIN_SPEECH_LENGTH_MS = 500            # Require 10+ frames of speech (was 300)
 TTS_PLAYBACK_GUARD_MS = 600
 
 # Outbound TTS back to FreeSWITCH

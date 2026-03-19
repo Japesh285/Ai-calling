@@ -29,7 +29,8 @@ DEFAULT_SPEAKER_WAV = "/home/developer/ai-calling/FLN Vo (1).wav"
 # Match XTTS output: 24kHz sample rate for consistent audio pipeline
 DEFAULT_SAMPLE_RATE = 24000
 # Match XTTS voice conditioning settings
-VOICE_DESCRIPTION = "A female speaker delivers a clear and friendly speech with moderate speed and pitch. The recording is of high quality, with the speaker's voice sounding natural and warm."
+# Delhi Hindi accent for natural Indian voice
+VOICE_DESCRIPTION = "A female speaker with a Delhi Hindi accent speaks clearly at a natural conversational pace. The recording is high quality with a warm, friendly tone typical of North Indian Hindi speech."
 
 # Language mapping for Indic languages
 INDIC_LANGUAGES = {
