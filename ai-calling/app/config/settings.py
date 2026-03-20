@@ -1,13 +1,25 @@
+import os
 from pathlib import Path
 
 # STT worker endpoint (Faster-Whisper service)
 STT_WORKERS = [
     "http://localhost:8001/transcribe",
 ]
+# TTS worker endpoint (Indic Parler TTS with Delhi accent)
 TTS_WORKERS = [
     "http://localhost:8002/synthesize",
 ]
+# Indic Parler (or compatible) — streaming + blocking synthesize
+# Default 8002 matches a typical `uvicorn indic_server:app --port 8002` setup.
+INDIC_TTS_URL = os.environ.get("INDIC_TTS_URL", "http://127.0.0.1:8002")
 AI_BRAIN_VOICE_URL = "http://127.0.0.1:9000/voice"
+
+# Raw RTP (symmetric) — advertise this IP:port to FreeSWITCH / your RTP forwarder
+RTP_ADVERTISE_HOST = os.environ.get("RTP_ADVERTISE_HOST", "127.0.0.1")
+# Outbound RTP payload type: 8 = PCMA (A-law), 0 = PCMU — match your FS leg codec
+RTP_OUT_PAYLOAD_TYPE = int(os.environ.get("RTP_OUT_PAYLOAD_TYPE", "8"))
+# RTP playout: fill this much 8 kHz PCM (mono16) before first packet — absorbs bursty TTS/HTTP.
+RTP_PLAYOUT_PREBUFFER_MS = int(os.environ.get("RTP_PLAYOUT_PREBUFFER_MS", "400"))
 
 # Audio buffering / flush policy (gateway-side orchestration only)
 STT_FLUSH_EVERY_N_CHUNKS = 250
@@ -28,8 +40,21 @@ MAX_SPEECH_LENGTH_MS = 10_000
 MIN_SPEECH_LENGTH_MS = 500            # Require 10+ frames of speech (was 300)
 TTS_PLAYBACK_GUARD_MS = 600
 
+# Inbound RMS must exceed this to count as barge-in while AI audio is playing
+# (echo/room noise often crosses SPEECH_START_RMS_THRESHOLD but stays below this).
+# Raised from 950 → 1080 to reduce false interrupts from speaker echo on telephony.
+BARGE_IN_RMS_THRESHOLD = 1080
+
+# Log full STT JSON from 8001 when transcript is empty or filtered (debug garbled Hindi).
+STT_LOG_RAW_ON_FAILURE = True
+
 # Outbound TTS back to FreeSWITCH
 FREESWITCH_OUTBOUND_MODE = "binary"
+
+# When True: stream PCM through a named pipe (one uuid_broadcast per utterance).
+# When False: write temp .wav per segment + uuid_broadcast (most reliable on FreeSWITCH).
+# FIFO + raw .r8 on a pipe is fragile (non-blocking write drops, FS may not seek pipes).
+USE_FIFO_PLAYBACK = True
 
 # Local paths
 BASE_DIR = Path(__file__).resolve().parents[2]

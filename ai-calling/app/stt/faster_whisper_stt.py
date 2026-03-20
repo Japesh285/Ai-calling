@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 
 import numpy as np
@@ -10,6 +11,20 @@ from app.utils.logger import get_logger
 
 
 logger = get_logger(__name__)
+
+STT_INITIAL_PROMPT = (
+    "नमस्ते। यह बातचीत भारतीय कर सहायता, जीएसटी, पैन, आयकर रिटर्न, आईटीआर से संबंधित है। "
+    "उपयोगकर्ता हिंदी में बोल रहा है।"
+)
+
+# Default faster-whisper model; override with env WHISPER_MODEL (e.g. large-v3 on GPU).
+_DEFAULT_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "medium")
+# Force Hindi for telephony tax assistant (reduces wrong-language drift on 8 kHz upsampled audio).
+# Set WHISPER_LANGUAGE empty to let Whisper auto-detect.
+_wh_lang = os.environ.get("WHISPER_LANGUAGE", "hi").strip()
+_WHISPER_LANGUAGE: str | None = _wh_lang if _wh_lang else None
+# VAD helps reject dial-tone / room noise between words; disable with WHISPER_VAD=0 if it clips tails.
+_USE_VAD = os.environ.get("WHISPER_VAD", "1").strip().lower() not in {"0", "false", "no"}
 
 
 def _resample_8k_to_16k(audio_float32: np.ndarray) -> np.ndarray:
@@ -25,11 +40,12 @@ class FasterWhisperSTT:
         device = "cuda" if torch.cuda.is_available() else "cpu"
         compute_type = "float16" if device == "cuda" else "int8"
         self.model = WhisperModel(
-            "medium",
+            _DEFAULT_WHISPER_MODEL,
             device=device,
             compute_type=compute_type,
         )
         self.last_detected_language = ""
+        self.last_transcribe_meta: dict = {}
         self._stream_buffer: np.ndarray | None = None
         self._stream_language = ""
 
@@ -42,24 +58,38 @@ class FasterWhisperSTT:
 
         segments, info = self.model.transcribe(
             audio_16k,
-            language=None,
+            language=_WHISPER_LANGUAGE,
             task="transcribe",
             beam_size=3,
             condition_on_previous_text=False,
-            vad_filter=False,
-            initial_prompt="नमस्ते। This conversation is with an Indian tax support assistant.",
+            vad_filter=_USE_VAD,
+            initial_prompt=STT_INITIAL_PROMPT,
         )
 
-        self.last_detected_language = getattr(info, "language", "") or ""
+        self.last_detected_language = getattr(info, "language", "") or (_WHISPER_LANGUAGE or "hi")
         if self.last_detected_language not in {"en", "hi"}:
             logger.warning("Unexpected language detected: %s → forcing hi", self.last_detected_language)
             self.last_detected_language = "hi"
         logger.info("Detected language: %s", self.last_detected_language)
 
-        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-        text = re.sub(r"\s+", " ", text).strip()
+        parts: list[str] = []
+        logprobs: list[float] = []
+        for segment in segments:
+            t = segment.text.strip()
+            if t:
+                parts.append(t)
+            lp = getattr(segment, "avg_logprob", None)
+            if lp is not None:
+                logprobs.append(float(lp))
 
-        logger.info("Transcript result: %s", text)
+        text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        self.last_transcribe_meta = {
+            "language": self.last_detected_language,
+            "segment_count": len(parts),
+            "avg_logprob": sum(logprobs) / len(logprobs) if logprobs else None,
+        }
+
+        logger.info("Transcript result: %s meta=%s", text, self.last_transcribe_meta)
         return text
 
     def init_stream(self) -> None:
@@ -87,12 +117,12 @@ class FasterWhisperSTT:
 
         segments, info = self.model.transcribe(
             self._stream_buffer,
-            language=self._stream_language if self._stream_language else None,
+            language=_WHISPER_LANGUAGE or self._stream_language or None,
             task="transcribe",
             beam_size=1,
             condition_on_previous_text=True,
-            vad_filter=False,
-            initial_prompt="नमस्ते। This conversation is with an Indian tax support assistant.",
+            vad_filter=_USE_VAD,
+            initial_prompt=STT_INITIAL_PROMPT,
             without_timestamps=True,
         )
 
@@ -117,21 +147,35 @@ class FasterWhisperSTT:
 
         segments, info = self.model.transcribe(
             self._stream_buffer,
-            language=self._stream_language if self._stream_language else None,
+            language=_WHISPER_LANGUAGE or self._stream_language or None,
             task="transcribe",
             beam_size=3,
             condition_on_previous_text=False,
-            vad_filter=False,
-            initial_prompt="नमस्ते। This conversation is with an Indian tax support assistant.",
+            vad_filter=_USE_VAD,
+            initial_prompt=STT_INITIAL_PROMPT,
         )
 
-        self.last_detected_language = getattr(info, "language", "") or ""
+        self.last_detected_language = getattr(info, "language", "") or (_WHISPER_LANGUAGE or "hi")
         if self.last_detected_language not in {"en", "hi"}:
             logger.warning("Unexpected language detected: %s → forcing hi", self.last_detected_language)
             self.last_detected_language = "hi"
 
-        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
-        text = re.sub(r"\s+", " ", text).strip()
+        parts = []
+        logprobs: list[float] = []
+        for segment in segments:
+            t = segment.text.strip()
+            if t:
+                parts.append(t)
+            lp = getattr(segment, "avg_logprob", None)
+            if lp is not None:
+                logprobs.append(float(lp))
+
+        text = re.sub(r"\s+", " ", " ".join(parts)).strip()
+        self.last_transcribe_meta = {
+            "language": self.last_detected_language,
+            "segment_count": len(parts),
+            "avg_logprob": sum(logprobs) / len(logprobs) if logprobs else None,
+        }
 
         self._stream_buffer = None
         return text

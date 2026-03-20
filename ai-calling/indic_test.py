@@ -2,11 +2,26 @@
 Indic TTS test script for Parler TTS (AI Bharat)
 Supports multiple Indic languages with Parler-TTS architecture.
 Uses locally cached model: ai4bharat/indic-parler-tts
+
+TESTS:
+1. Blocking generation (standard)
+2. Streaming generation (ParlerTTSStreamer)
 """
 import torch
 import numpy as np
 import soundfile as sf
 import os
+import time
+from threading import Thread
+
+# Try to import streaming support
+try:
+    from parler_tts import ParlerTTSStreamer
+    STREAMING_AVAILABLE = True
+    print("✓ ParlerTTSStreamer available")
+except ImportError:
+    STREAMING_AVAILABLE = False
+    print("✗ ParlerTTSStreamer NOT available")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -60,6 +75,176 @@ description_tokenizer = AutoTokenizer.from_pretrained(
 )
 
 print("Model loaded.")
+
+
+def generate_blocking(text, description, model, tokenizer, description_tokenizer, ref_inputs, device):
+    """Standard blocking generation - waits for complete audio."""
+    description_input_ids = description_tokenizer(description, return_tensors="pt").to(device)
+    prompt_input_ids = tokenizer(text, return_tensors="pt").to(device)
+    
+    estimated_audio_tokens = prompt_input_ids.input_ids.shape[1] * 15
+    max_length = min(estimated_audio_tokens + 50, 1500)
+    
+    start_time = time.monotonic()
+    
+    with torch.inference_mode():
+        if ref_inputs is not None:
+            generation = model.generate(
+                input_ids=description_input_ids.input_ids,
+                attention_mask=description_input_ids.attention_mask,
+                prompt_input_ids=prompt_input_ids.input_ids,
+                prompt_attention_mask=prompt_input_ids.attention_mask,
+                **ref_inputs,
+                pad_token_id=tokenizer.pad_token_id,
+                max_length=max_length,
+                min_new_tokens=10,
+                do_sample=True,
+                temperature=1.0,
+            )
+        else:
+            generation = model.generate(
+                input_ids=description_input_ids.input_ids,
+                attention_mask=description_input_ids.attention_mask,
+                prompt_input_ids=prompt_input_ids.input_ids,
+                prompt_attention_mask=prompt_input_ids.attention_mask,
+                pad_token_id=tokenizer.pad_token_id,
+                max_length=max_length,
+                min_new_tokens=10,
+                do_sample=True,
+                temperature=1.0,
+            )
+        
+        if hasattr(generation, 'audio_values'):
+            audio = generation.audio_values.cpu().numpy()[0]
+        else:
+            audio = generation.cpu().numpy()[0]
+    
+    elapsed = time.monotonic() - start_time
+    return audio, elapsed
+
+
+def test_streaming(text, description, model, tokenizer, description_tokenizer, ref_inputs, device, sample_rate):
+    """Test streaming generation with ParlerTTSStreamer."""
+    if not STREAMING_AVAILABLE:
+        print("\n=== STREAMING TEST SKIPPED ===")
+        print("ParlerTTSStreamer not available")
+        return None, None
+    
+    print("\n" + "="*60)
+    print("TEST 2: STREAMING GENERATION")
+    print("="*60)
+    
+    description_input_ids = description_tokenizer(description, return_tensors="pt").to(device)
+    prompt_input_ids = tokenizer(text, return_tensors="pt").to(device)
+    estimated_audio_tokens = prompt_input_ids.input_ids.shape[1] * 15
+    max_length = min(estimated_audio_tokens + 50, 1500)
+    
+    # Create streamer - play_steps determines chunk size
+    # play_steps=50 ≈ 0.55 seconds of audio per chunk at 44.1kHz
+    play_steps = 50
+    print(f"Creating ParlerTTSStreamer with play_steps={play_steps}...")
+    
+    streamer = ParlerTTSStreamer(
+        model,
+        device=device,
+        play_steps=play_steps,
+        stride=5,  # Overlap for smoother playback
+    )
+    
+    generation_kwargs = dict(
+        input_ids=description_input_ids.input_ids,
+        attention_mask=description_input_ids.attention_mask,
+        prompt_input_ids=prompt_input_ids.input_ids,
+        prompt_attention_mask=prompt_input_ids.attention_mask,
+        streamer=streamer,
+        pad_token_id=tokenizer.pad_token_id,
+        max_length=max_length,
+        min_new_tokens=10,
+        do_sample=True,
+        temperature=1.0,
+    )
+    
+    if ref_inputs is not None:
+        generation_kwargs['ref_inputs'] = ref_inputs
+    
+    # Collect chunks and timing
+    chunks = []
+    chunk_times = []
+    first_chunk_time = None
+    generation_start = time.monotonic()
+    
+    def run_generation():
+        try:
+            with torch.inference_mode():
+                model.generate(**generation_kwargs)
+        except Exception as e:
+            print(f"Generation error: {e}")
+        finally:
+            streamer.end()
+    
+    # Start generation in background thread
+    print("Starting generation in background thread...")
+    thread = Thread(target=run_generation)
+    thread.start()
+    
+    # Collect chunks as they arrive
+    print("Collecting audio chunks...")
+    try:
+        for chunk in streamer:
+            chunk_time = time.monotonic() - generation_start
+            chunk_times.append(chunk_time)
+            chunks.append(chunk)
+            
+            if first_chunk_time is None:
+                first_chunk_time = chunk_time
+                print(f"  ✓ First chunk received at {first_chunk_time:.2f}s ({len(chunk)} samples)")
+            else:
+                print(f"  ✓ Chunk {len(chunks)} received at {chunk_time:.2f}s ({len(chunk)} samples)")
+    except Exception as e:
+        print(f"Stream iteration error: {e}")
+    
+    thread.join(timeout=5.0)
+    total_time = time.monotonic() - generation_start
+    
+    print(f"\n--- Streaming Results ---")
+    print(f"  Chunks received: {len(chunks)}")
+    print(f"  Time to first chunk: {first_chunk_time:.2f}s" if first_chunk_time else "  Time to first chunk: N/A")
+    print(f"  Total generation time: {total_time:.2f}s")
+    
+    if chunks:
+        # Concatenate chunks
+        audio = np.concatenate(chunks)
+        audio_duration = len(audio) / sample_rate
+        print(f"  Total audio samples: {len(audio)}")
+        print(f"  Audio duration: {audio_duration:.2f}s")
+        
+        # Calculate latency improvement
+        if first_chunk_time:
+            latency_ratio = first_chunk_time / total_time if total_time > 0 else 0
+            print(f"  Latency improvement: {(1 - latency_ratio) * 100:.1f}% faster first audio")
+        
+        return audio, total_time
+    
+    return None, None
+
+
+def test_blocking(text, description, model, tokenizer, description_tokenizer, ref_inputs, device, sample_rate):
+    """Test standard blocking generation."""
+    print("\n" + "="*60)
+    print("TEST 1: BLOCKING GENERATION")
+    print("="*60)
+    
+    audio, elapsed = generate_blocking(
+        text, description, model, tokenizer, description_tokenizer, ref_inputs, device
+    )
+    
+    audio_duration = len(audio) / sample_rate
+    print(f"\n--- Blocking Results ---")
+    print(f"  Total generation time: {elapsed:.2f}s")
+    print(f"  Audio duration: {audio_duration:.2f}s")
+    print(f"  Real-time factor: {elapsed / audio_duration:.2f}x")
+    
+    return audio, elapsed
 
 # Input configuration
 text = "नमस्ते आपका स्वागत है"

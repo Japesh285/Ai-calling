@@ -29,7 +29,9 @@ async def transcribe(audio: UploadFile):
         raise HTTPException(status_code=400, detail=f"Invalid WAV upload: {exc}") from exc
 
     text = stt.transcribe(pcm_bytes)
-    return {"text": text, "language": stt.last_detected_language}
+    out: dict = {"text": text, "language": stt.last_detected_language}
+    out.update(getattr(stt, "last_transcribe_meta", {}) or {})
+    return out
 
 
 @app.post("/transcribe/stream")
